@@ -1,0 +1,148 @@
+name: Build, Package and Deploy to Azure VM
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # safe defaults — these come from secrets in steps
+  RELEASE_DIR_PREFIX: "/opt/myapp/releases"
+
+jobs:
+  build-package-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # -----------------------------
+      # 1) Checkout code, install Node, run tests, package ZIP
+      # -----------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Create release ZIP (exclude node_modules, .git, .github)
+        id: package
+        run: |
+          TIMESTAMP=$(date +%s)
+          ZIP_NAME="release-${TIMESTAMP}.zip"
+          # zip everything except node_modules, .git, .github and tests (tweak exclude list if needed)
+          zip -r "$ZIP_NAME" . -x "node_modules/*" ".git/*" ".github/*" "test/*" "tests/*"
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "Created $ZIP_NAME"
+
+      # -----------------------------
+      # 2) Azure login (service principal)
+      # -----------------------------
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      # -----------------------------
+      # 3) Upload ZIP to Azure Blob & generate 1-hour SAS URL
+      #    (stores SAS URL in step output `package_sas_url`)
+      # -----------------------------
+      - name: Upload ZIP to Azure Blob and create SAS
+        id: upload_blob
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            set -e
+            AZ_ACCOUNT="${{ secrets.AZ_STORAGE_ACCOUNT }}"
+            AZ_KEY="${{ secrets.AZ_STORAGE_KEY }}"
+            AZ_CONTAINER="${{ secrets.AZ_STORAGE_CONTAINER }}"
+            ZIP_NAME="${{ steps.package.outputs.zip_name }}"
+
+            echo "Creating container (if not exists)..."
+            az storage container create \
+              --name "$AZ_CONTAINER" \
+              --account-name "$AZ_ACCOUNT" \
+              --account-key "$AZ_KEY" \
+              --output none || true
+
+            echo "Uploading $ZIP_NAME..."
+            az storage blob upload \
+              --account-name "$AZ_ACCOUNT" \
+              --account-key "$AZ_KEY" \
+              --container-name "$AZ_CONTAINER" \
+              --name "releases/$ZIP_NAME" \
+              --file "$ZIP_NAME" \
+              --overwrite true \
+              --output none
+
+            EXPIRY=$(date -u -d "1 hour" '+%Y-%m-%dT%H:%MZ')
+            SAS_TOKEN=$(az storage blob generate-sas \
+              --account-name "$AZ_ACCOUNT" \
+              --account-key "$AZ_KEY" \
+              --container-name "$AZ_CONTAINER" \
+              --name "releases/$ZIP_NAME" \
+              --permissions r \
+              --expiry "$EXPIRY" \
+              --auth-mode key -o tsv)
+
+            PACKAGE_SAS_URL="https://${AZ_ACCOUNT}.blob.core.windows.net/${AZ_CONTAINER}/releases/${ZIP_NAME}?${SAS_TOKEN}"
+            echo "package_sas_url=$PACKAGE_SAS_URL" >> $GITHUB_OUTPUT
+            echo "PACKAGE_SAS_URL created"
+      # -----------------------------
+      # 4) Deploy on the VM using az vm run-command (no SSH)
+      #    The command will:
+      #      - create /opt/myapp/releases/<ts>
+      #      - install Node 22 if missing, install pm2, unzip, curl
+      #      - download ZIP via SAS, unzip, npm ci --omit=dev
+      #      - symlink /opt/myapp/current -> release dir
+      #      - start app with pm2 and save the process list
+      # -----------------------------
+      - name: Deploy to Azure VM (az vm run-command)
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            set -e
+            AZ_RG="${{ secrets.AZURE_RESOURCE_GROUP }}"
+            AZ_VM="${{ secrets.AZURE_VM_NAME }}"
+            PACKAGE_SAS="${{ steps.upload_blob.outputs.package_sas_url }}"
+            echo "Invoking run-command on VM $AZ_VM in RG $AZ_RG"
+
+            # The following passes multiple --scripts entries; they will be executed on the VM (as root)
+            az vm run-command invoke \
+              --resource-group "$AZ_RG" \
+              --name "$AZ_VM" \
+              --command-id RunShellScript \
+              --scripts \
+                "set -e" \
+                "SAS_URL='${PACKAGE_SAS}'" \
+                "RELEASE_DIR_PREFIX='${RELEASE_DIR_PREFIX}'" \
+                "mkdir -p \${RELEASE_DIR_PREFIX}" \
+                "RELEASE_DIR=\${RELEASE_DIR_PREFIX}/\$(date +%s)" \
+                "mkdir -p \"\$RELEASE_DIR\"" \
+                "apt-get update -y" \
+                "apt-get install -y curl unzip gnupg2 ca-certificates" \
+                "if ! command -v node >/dev/null || ! node -v | grep -q '^v22'; then curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; apt-get install -y nodejs; fi" \
+                "npm install -g pm2 || true" \
+                "cd \"\$RELEASE_DIR\"" \
+                "echo Downloading package..." \
+                "curl -fsSL \"\$SAS_URL\" -o package.zip" \
+                "unzip -o package.zip" \
+                "if [ -f package.json ]; then npm ci --omit=dev; fi" \
+                "mkdir -p /opt/myapp" \
+                "ln -sfn \"\$RELEASE_DIR\" /opt/myapp/current" \
+                "cd /opt/myapp/current" \
+                "pm2 start npm --name myapp -- start || pm2 restart myapp || pm2 start npm --name myapp -- start" \
+                "pm2 save" \
+              -o json
