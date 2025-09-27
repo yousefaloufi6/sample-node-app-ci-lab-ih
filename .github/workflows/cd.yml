@@ -81,8 +81,8 @@ jobs:
               --name "$AZURE_VM_NAME" \
               --command-id RunShellScript \
               --scripts "cat > /tmp/deploy.sh << 'DEPLOY_SCRIPT_EOF'$(cat deploy.sh)
-DEPLOY_SCRIPT_EOF
-chmod +x /tmp/deploy.sh" || exit 1
+             DEPLOY_SCRIPT_EOF
+            chmod +x /tmp/deploy.sh" || exit 1
 
             # Execute deploy script
             timeout 900 az vm run-command invoke \
