@@ -1,39 +1,45 @@
-name: Lab 3 (Online) or Lab 1 (Onsite)
+name: Build, Test & SonarCloud Scan
 
 on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  actions: read
-  checks: write
-  pull-requests: write
-  id-token: write
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  build-and-test:
+  build-test-sonar:
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4.4.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 22.x
-          cache: npm
-          cache-dependency-path: package-lock.json
+          node-version: 18
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Build the application (optional)
-        run: |
-          npm run build 2>/dev/null || echo "No build script found, skipping build step"
+      - name: Run build
+        run: npm run build --if-present
+
+      - name: Run tests
+        run: npm test
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.organization=your-org
+            -Dsonar.projectKey=sample-node-app-saurabh
+            -Dsonar.host.url=https://sonarcloud.io
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       # Skip sonarqube
       # - name: Run unit tests with coverage and JUnit reports
