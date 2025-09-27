@@ -1,0 +1,92 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test-sonar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test -- --ci --reporters=default --reporters=jest-junit
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectBaseDir=.
+            -Dsonar.organization=your-org
+            -Dsonar.projectKey=sample-node-app-saurabh
+            -Dsonar.host.url=https://sonarcloud.io
+
+  package-deploy:
+    runs-on: ubuntu-latest
+    needs: build-test-sonar
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Build package
+        run: |
+          zip -r app.zip .
+
+      - name: Upload to Azure Blob
+        uses: azure/CLI@v2
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZ_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
+          PACKAGE_SAS_URL: ${{ secrets.PACKAGE_SAS_URL }}
+        with:
+          inlineScript: |
+            az storage blob upload \
+              --account-name $AZURE_STORAGE_ACCOUNT \
+              --container-name ${{ secrets.AZ_STORAGE_CONTAINER }} \
+              --name app.zip \
+              --file app.zip \
+              --overwrite
+
+      - name: Deploy to Azure VM
+        uses: azure/CLI@v2
+        timeout-minutes: 15
+        env:
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          PACKAGE_SAS_URL: ${{ secrets.PACKAGE_SAS_URL }}
+        with:
+          inlineScript: |
+            # Upload deploy script to VM
+            timeout 300 az vm run-command invoke \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$AZURE_VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "cat > /tmp/deploy.sh << 'DEPLOY_SCRIPT_EOF'$(cat deploy.sh)
+              DEPLOY_SCRIPT_EOF
+             chmod +x /tmp/deploy.sh" || exit 1
+
+            # Execute deploy script
+            timeout 900 az vm run-command invoke \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$AZURE_VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "sudo timeout 800 /tmp/deploy.sh '$PACKAGE_SAS_URL'" || exit 1
