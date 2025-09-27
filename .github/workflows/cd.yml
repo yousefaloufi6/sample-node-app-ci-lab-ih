@@ -1,4 +1,4 @@
-name: Build, Test, SonarQube, and Deploy
+name: Node.js CI/CD with SonarQube & Azure VM
 
 on:
   push:
@@ -9,63 +9,91 @@ on:
       - main
 
 jobs:
+  build-test-sonar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --reporters=default --reporters=jest-junit
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        with:
+          args: >
+            -Dsonar.projectKey=sample-node-app-saurabh
+            -Dsonar.organization=sda
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+            -Dsonar.tests=tests/
+            -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js
+            -Dsonar.coverage.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+
   build-package-deploy:
     runs-on: ubuntu-latest
-
+    needs: build-test-sonar
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: 18
+      - name: Build project
+        run: npm run build
 
-    - name: Install dependencies
-      run: npm ci
+      - name: Package project
+        run: zip -r package.zip .
 
-    - name: Run tests
-      run: npm test
-      continue-on-error: false
+      - name: Upload package to Azure Storage
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ secrets.AZ_STORAGE_ACCOUNT }} \
+              --container-name ${{ secrets.AZ_STORAGE_CONTAINER }} \
+              --name package.zip \
+              --file package.zip \
+              --account-key ${{ secrets.AZ_STORAGE_KEY }}
 
-    - name: Run SonarQube analysis
-      uses: SonarSource/sonarqube-scan-action@v6
-      with:
-        projectBaseDir: .
-        organization: sda
-        projectKey: sample-node-app-saurabh
-        host-url: ${{ secrets.SONAR_HOST_URL }}
-        token: ${{ secrets.SONAR_TOKEN }}
-        # Exclude test, node_modules, coverage
-        extra-properties: |
-          sonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
-          sonar.tests=tests/
-          sonar.test.inclusions=**/*.test.js,**/*.spec.js
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          auth-type: oidc
 
-    - name: Azure login
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDS }}
+      - name: Upload and execute deployment script
+        uses: azure/cli@v2.1.0
+        timeout-minutes: 15
+        env:
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
+          PACKAGE_SAS_URL: ${{ env.PACKAGE_SAS_URL }}
+        with:
+          inlineScript: |
+            # Upload deploy.sh to VM with timeout
+            timeout 300 az vm run-command invoke \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$AZURE_VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "cat > /tmp/deploy.sh << 'DEPLOY_SCRIPT_EOF'$(cat deploy.sh)
+DEPLOY_SCRIPT_EOF
+chmod +x /tmp/deploy.sh" || exit 1
 
-    - name: Package app
-      run: zip -r app.zip .
-
-    - name: Upload to Azure Storage
-      uses: azure/cli@v1
-      with:
-        inlineScript: |
-          az storage blob upload \
-            --account-name ${{ secrets.AZ_STORAGE_ACCOUNT }} \
-            --container-name ${{ secrets.AZ_STORAGE_CONTAINER }} \
-            --name app.zip \
-            --file app.zip \
-            --auth-mode key \
-            --account-key ${{ secrets.AZ_STORAGE_KEY }}
-
-    - name: Deploy to Azure VM
-      uses: azure/cli@v1
-      with:
-        inlineScript: |
-          ssh -o StrictHostKeyChecking=no azureuser@${{ secrets.AZURE_VM_NAME }} \
-          'unzip -o ~/app.zip -d ~/app && pm2 restart app || pm2 start ~/app/index.js --name app'
+            # Execute deploy.sh with timeout and logging
+            timeout 900 az vm run-command invoke \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$AZURE_VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "sudo timeout 800 /tmp/deploy.sh '$PACKAGE_SAS_URL'" || exit 1
 
