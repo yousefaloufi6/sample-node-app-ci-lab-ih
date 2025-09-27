@@ -1,158 +1,71 @@
-name: Deploy Node App on Azure VM
+name: Build, Test, SonarQube, and Deploy
 
 on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  actions: read
-  checks: write
-  pull-requests: write
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build-package-deploy:
     runs-on: ubuntu-latest
-    environment: dev
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Checkout repository
+      uses: actions/checkout@v3
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: npm
-          cache-dependency-path: package-lock.json
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: 18
 
-      - name: Install dependencies
-        run: npm ci
+    - name: Install dependencies
+      run: npm ci
 
-      - name: Build the application (optional)
-        run: |
-          npm run build 2>/dev/null || echo "No build script found, skipping build step"
+    - name: Run tests
+      run: npm test
+      continue-on-error: false
 
-      - name: Run unit tests with coverage and JUnit reports
-        env:
-          JEST_JUNIT_OUTPUT: coverage/junit.xml
-        run: npm run test:ci
+    - name: Run SonarQube analysis
+      uses: SonarSource/sonarqube-scan-action@v6
+      with:
+        projectBaseDir: .
+        organization: sda
+        projectKey: sample-node-app-saurabh
+        host-url: ${{ secrets.SONAR_HOST_URL }}
+        token: ${{ secrets.SONAR_TOKEN }}
+        # Exclude test, node_modules, coverage
+        extra-properties: |
+          sonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+          sonar.tests=tests/
+          sonar.test.inclusions=**/*.test.js,**/*.spec.js
 
-      - name: Publish test results to Checks
-        uses: dorny/test-reporter@v2
-        if: always()
-        with:
-          name: Jest Test Results
-          path: coverage/junit.xml
-          reporter: jest-junit
-          fail-on-error: true
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDS }}
 
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-node
-          path: coverage/
-          retention-days: 30
+    - name: Package app
+      run: zip -r app.zip .
 
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v6
-        env:
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=sample-node-app-saurabh
-            -Dsonar.organization=sda
-            -Dsonar.token=${{ secrets.SONAR_TOKEN }}
-            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }}
-            -Dsonar.sources=.
-            -Dsonar.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
-            -Dsonar.tests=tests/
-            -Dsonar.test.inclusions=**/*.test.js,**/*.spec.js
-            -Dsonar.coverage.exclusions=node_modules/**,coverage/**,tests/**,**/*.test.js,**/*.spec.js
+    - name: Upload to Azure Storage
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          az storage blob upload \
+            --account-name ${{ secrets.AZ_STORAGE_ACCOUNT }} \
+            --container-name ${{ secrets.AZ_STORAGE_CONTAINER }} \
+            --name app.zip \
+            --file app.zip \
+            --auth-mode key \
+            --account-key ${{ secrets.AZ_STORAGE_KEY }}
 
-      - name: Create deployment package
-        run: |
-          set -euo pipefail
-          STAGING="$GITHUB_WORKSPACE/deployment-package"
-          rm -rf "$STAGING"
-          mkdir -p "$STAGING"
-
-          [ -d public ] && cp -r public "$STAGING/" || echo "No public/ directory found"
-          [ -f server.js ] && cp server.js "$STAGING/" || echo "No server.js found"
-          cp package.json "$STAGING/"
-          cp package-lock.json "$STAGING/"
-          [ -f README.md ] && cp README.md "$STAGING/" || true
-          [ -f Dockerfile ] && cp Dockerfile "$STAGING/" || echo "No Dockerfile found"
-
-          (cd "$STAGING" && npm pkg delete devDependencies || true)
-
-          TS="$(date +%Y%m%d-%H%M%S)"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          ZIP_NAME="deployment-package-${SHORT_SHA}-${TS}.zip"
-          (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" "deployment-package")
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-
-      - name: Login to Azure
-        uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDS }}
-
-      - name: Upload package to Blob
-        uses: azure/cli@v2
-        env:
-          ZIP_NAME: ${{ env.ZIP_NAME }}
-          AZ_STORAGE_ACCOUNT: ${{ secrets.AZ_STORAGE_ACCOUNT }}
-          AZ_STORAGE_CONTAINER: ${{ secrets.AZ_STORAGE_CONTAINER }}
-          AZ_STORAGE_KEY: ${{ secrets.AZ_STORAGE_KEY }}
-        with:
-          inlineScript: |
-            set -euo pipefail
-            : "${AZ_STORAGE_ACCOUNT:?missing}"
-            : "${AZ_STORAGE_CONTAINER:?missing}"
-            : "${AZ_STORAGE_KEY:?missing}"
-            : "${ZIP_NAME:?missing}"
-
-            az storage container create \
-              --name "$AZ_STORAGE_CONTAINER" \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --only-show-errors 1>/dev/null
-
-            az storage blob upload \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --container-name "$AZ_STORAGE_CONTAINER" \
-              --file "$ZIP_NAME" \
-              --name "$ZIP_NAME" \
-              --overwrite true \
-              --only-show-errors
-
-            SAS=$(az storage blob generate-sas \
-              --account-name "$AZ_STORAGE_ACCOUNT" \
-              --account-key "$AZ_STORAGE_KEY" \
-              --container-name "$AZ_STORAGE_CONTAINER" \
-              --name "$ZIP_NAME" \
-              --permissions r \
-              --expiry "$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%MZ')" \
-              --https-only --full-uri -o tsv)
-
-            echo "::add-mask::$SAS"
-            echo "PACKAGE_SAS_URL=$SAS" >> "$GITHUB_ENV"
-
-      - name: Upload and execute deployment script
-        uses: azure/cli@v2
-        env:
-          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          AZURE_VM_NAME: ${{ secrets.AZURE_VM_NAME }}
-          PACKAGE_SAS_URL: ${{ env.PACKAGE_SAS_URL }}
-        with:
-          inlineScript: |
-            az vm run-command invoke \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$AZURE_VM_NAME" \
-              --command-id RunShellScript \
-              --scripts "curl -sSL $PACKAGE_SAS_URL -o /tmp/app.zip && sudo mkdir -p /opt/myapp && sudo unzip -o /tmp/app.zip -d /opt/myapp/current && cd /opt/myapp/current && npm ci --omit=dev && pm2 restart all || pm2 start server.js --name myapp && pm2 save"
+    - name: Deploy to Azure VM
+      uses: azure/cli@v1
+      with:
+        inlineScript: |
+          ssh -o StrictHostKeyChecking=no azureuser@${{ secrets.AZURE_VM_NAME }} \
+          'unzip -o ~/app.zip -d ~/app && pm2 restart app || pm2 start ~/app/index.js --name app'
 
